@@ -1,0 +1,35 @@
+version: '3.8'
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - SLACK_BOT_TOKEN=xoxb-dummy-token
+      - AGENT_SERVICE_URL=http://agents:8000
+    depends_on:
+      - redis
+      - agents
+  agents:
+    build:
+      context: ./agents
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+  interceptor:
+    build:
+      context: ./interceptor
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - CONTROL_PLANE_URL=http://control-plane:3000
+    depends_on:
+      - control-plane
