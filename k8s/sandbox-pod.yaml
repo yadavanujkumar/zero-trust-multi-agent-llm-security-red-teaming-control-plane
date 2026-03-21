@@ -1,14 +1,314 @@
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  namespace: llm-redteam-sandbox
-  name: sandbox-manager
-rules:
-- apiGroups: ["batch", "extensions"]
-  resources: ["jobs"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
----  
+---
+# Namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: llm-redteam-sandbox
+  labels:
+    app.kubernetes.io/managed-by: control-plane
+    security.io/environment: sandbox
+---
+# RBAC: ServiceAccount for the control plane
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: control-plane-sa
+  namespace: llm-security
+  labels:
+    app.kubernetes.io/name: llm-security-control-plane
+---
+# RBAC: Role — minimum permissions for sandbox job management
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: sandbox-manager
+  namespace: llm-redteam-sandbox
+  labels:
+    app.kubernetes.io/managed-by: control-plane
+rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+# RBAC: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: control-plane-sandbox-binding
+  namespace: llm-redteam-sandbox
+subjects:
+  - kind: ServiceAccount
+    name: control-plane-sa
+    namespace: llm-security
+roleRef:
+  kind: Role
+  name: sandbox-manager
+  apiGroup: rbac.authorization.k8s.io
+---
+# ConfigMap for control plane environment variables
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: control-plane-config
+  namespace: llm-security
+data:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  PORT: "3000"
+  AGENT_SERVICE_URL: "http://agents-svc.llm-security.svc.cluster.local:8000"
+  REDIS_URL: "redis://redis-svc.llm-security.svc.cluster.local:6379"
+  SANDBOX_NAMESPACE: "llm-redteam-sandbox"
+  SANDBOX_IMAGE: "alpine:3.19"
+  SANDBOX_JOB_TTL: "120"
+  PROMPT_CACHE_TTL: "60"
+  RATE_LIMIT_MAX: "100"
+  SLACK_CHANNEL: "#security-alerts"
+  DASHBOARD_URL: "https://security.internal/dashboard"
+---
+# Deployment: Control Plane
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: control-plane
+  namespace: llm-security
+  labels:
+    app: control-plane
+    app.kubernetes.io/version: "2.0.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: control-plane
+  template:
+    metadata:
+      labels:
+        app: control-plane
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: control-plane-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+        - name: control-plane
+          image: llm-security-control-plane:2.0.0
+          ports:
+            - containerPort: 3000
+          envFrom:
+            - configMapRef:
+                name: control-plane-config
+          env:
+            - name: SLACK_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: control-plane-secrets
+                  key: slack-bot-token
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# Service: Control Plane
+apiVersion: v1
+kind: Service
+metadata:
+  name: control-plane-svc
+  namespace: llm-security
+spec:
+  selector:
+    app: control-plane
+  ports:
+    - port: 3000
+      targetPort: 3000
+      protocol: TCP
+---
+# HorizontalPodAutoscaler
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: control-plane-hpa
+  namespace: llm-security
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: control-plane
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+---
+# Deployment: Agent Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agents
+  namespace: llm-security
+  labels:
+    app: agents
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: agents
+  template:
+    metadata:
+      labels:
+        app: agents
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: agents
+          image: llm-security-agents:2.0.0
+          ports:
+            - containerPort: 8000
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "1000m"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+---
+# Service: Agent Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: agents-svc
+  namespace: llm-security
+spec:
+  selector:
+    app: agents
+  ports:
+    - port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+# Deployment: Interceptor
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: interceptor
+  namespace: llm-security
+  labels:
+    app: interceptor
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: interceptor
+  template:
+    metadata:
+      labels:
+        app: interceptor
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: interceptor
+          image: llm-security-interceptor:2.0.0
+          ports:
+            - containerPort: 8080
+          env:
+            - name: CONTROL_PLANE_URL
+              value: "http://control-plane-svc.llm-security.svc.cluster.local:3000"
+            - name: PORT
+              value: ":8080"
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "256Mi"
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# Service: Interceptor (LoadBalancer / NodePort for external access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: interceptor-svc
+  namespace: llm-security
+spec:
+  type: LoadBalancer
+  selector:
+    app: interceptor
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
