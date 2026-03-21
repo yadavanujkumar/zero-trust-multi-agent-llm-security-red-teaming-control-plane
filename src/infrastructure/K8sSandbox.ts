@@ -90,7 +90,7 @@ export class K8sSandbox {
     };
 
     try {
-      await this.k8sApi.createNamespacedJob(SANDBOX_NAMESPACE, job);
+      await this.k8sApi.createNamespacedJob({ namespace: SANDBOX_NAMESPACE, body: job });
       sandboxJobsTotal.inc();
       logger.info('K8s sandbox job created', { jobId, requestId, promptHash });
       return jobId;
