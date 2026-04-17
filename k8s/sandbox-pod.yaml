@@ -3,6 +3,15 @@
 apiVersion: v1
 kind: Namespace
 metadata:
+  name: llm-security
+  labels:
+    app.kubernetes.io/managed-by: control-plane
+    security.io/environment: production
+---
+# Namespace
+apiVersion: v1
+kind: Namespace
+metadata:
   name: llm-redteam-sandbox
   labels:
     app.kubernetes.io/managed-by: control-plane
